@@ -1,4 +1,4 @@
 # swiftHashing
 Experiments with Swift + Hashing
 
-I played around with the Swift Hashing algorithms
+@rtreffer and I played around with the Swift Hashing algorithms
