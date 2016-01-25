@@ -20,3 +20,16 @@ for i in 1..<10000 {
 }
 
 print(d.count)
+
+/*
+The 'new' murmur based hashing algorithm is used due to the ordering relation.
+However String ordering is broken in swift.
+*/
+
+print("a" > "a\0")  // false
+print("a" < "a\0")  // false
+print("a" >= "a\0") // true
+print("a" <= "a\0") // true
+print("a" == "a\0") // false
+print("a" != "a\0") // true
+
