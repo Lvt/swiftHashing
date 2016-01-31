@@ -5,62 +5,40 @@ The core of the OS X hashing function is
 result(-1) := 0
 result(n)  := result(n-1) * 257 + c(n)
 
-(It is actually a bit more complicated, but this simplification is sufficiant
-for collision on strings of the same length)
+(
+ They are adding the string length and some other irrelevant things to the
+ hash but a collision of two equally long strings under this method will
+ be a collision under the ObjC method found at
+ https://opensource.apple.com/source/CF/CF-1153.18/CFString.c
+)
 
-This can be rewritten as
-result(n) := result(n-1) * 256 + result(n-1) + c(n)
+Note that the method is additive.
+hash("ab") = hash("a\0") + hash("\0b")
 
-Note that 256 aligns well with byte boundaries.
+Also note that the last 6 chars can not produce an overflow.
 
-Resolving the recursion reveals a nice formular for various strings
+We can thus compute a map of hash -> suffix pairs.
+The algorithm works with 3 char strings at a time, filling a 12 char string.
 
-s() -> 0
-s(c0) -> c0
-s(c0,c1) -> c0 * 256 + c0 + c1
-s(c0,c1,c2) -> c0 * (256^2) + 2 * c0 * 256 + c0 + c1 * 256 + c1
-[...]
+The last 3 chars must have a hash value that fills the gap towards the result hash.
+Chars 0..(n-6) must form a hash that is within the bounds of [resultHash-maxHash6,resultHash-minHash6].
+Chars 0..(n-3) must form a hash that is within the bounds of [resultHash-maxHash3,resultHash-minHash3].
 
-The factors for each element are actually binomial coefficients.
+Constructing a 12 char strings works like this
+- pick a tripple
+- pick another tripple
+-> compute the prefix hash := hash1 * 257^9 + hash2 * 257^6
+-> check if the prefix hash is in [resultHash-maxHash6,resultHash-minHash6]
+- pick another tripple
+- compute the hash := hash1 * 257^9 + hash2 * 257^6 + hash3 * 257^3
+-> check if the hash is in [resultHash-maxHash3,resultHash-minHash3]
+- compute the delta resultHash - hash
+- find a suffix by delta
+-> if there is a suffix by delte output the concat of all 4 tripples
 
-    1
-   1 1
-  1 2 1
- 1 3 3 1
-1 4 6 4 1 
-
-Rewriting this as a more traditional matrix:
-
-1 1 1 1 1     c0     (result byte4)
-4 3 2 1 0     c1     (result byte3)
-6 3 1 0 0  x  c2  =  (result byte2)
-4 1 0 0 0     c3     (result byte1)
-1 0 0 0 0     c4     (result byte0)
-
-This matrix is limited to 8 rows due to the output size. Meaning it will be heavily
-underconstraint for inputs of >8 chars.
-
-We thus construct the 12x8 matrix as our workhorse
-
-  1   1   1   1   1   1   1   1   1   1   1   1      % 256*256*256*256*256*256*256*256
- 11  10   9   8   7   6   5   4   3   2   1   0      % 256*256*256*256*256*256*256
- 55  45  36  28  21  15  10   6   3   1   0   0      % 256*256*256*256*256*256
-165 120  84  56  35  20  10   4   1   0   0   0      % 256*256*256*256*256
-330 210 126  70  35  15   5   1   0   0   0   0      % 256*256*256*256
-462 252 126  56  21   6   1   0   0   0   0   0      % 256*256*256
-462 210  84  28   7   1   0   0   0   0   0   0      % 256*256
-330 120  36   8   1   0   0   0   0   0   0   0      % 256
-
-The mod groups are a result of the byte shifting. The highest byte is
-<result byte 0> * (256)^7 % 256^8 meaning it is equivilent to
-<result byte 0> % 256. This extra condition should be irrelevant for all
-but the highest bytes.
-
-If two vectors v1 and v2 have the same result r then both will produce the same
-hash. We simply start with a random text generating a random hash and search
-for collisions by picking all combinations of input that can produce the same
-hash. Note that there might be more hashes than found by this algorithm.
-
+Easy, right?
+Runtime is not so awesome, but it will dump many collisions and should finish
+within days if you'd like to exhaust one run.
 */
 
 #if os(Linux)
@@ -71,11 +49,16 @@ hash. Note that there might be more hashes than found by this algorithm.
 #endif
 
 extension String {
-
   subscript (i: Int) -> Character {
     return self[self.startIndex.advancedBy(i)]
   }
-
+  func objcHash () -> UInt64 {
+    var result = UInt64(0)
+    for c in unicodeScalars {
+      result = result &* UInt64(257) &+ UInt64(c.value & 0xff)
+    }
+    return result
+  }
 }
 
 func cs_arc4random_uniform(upperBound: UInt32) -> UInt32 {  
@@ -86,76 +69,94 @@ func cs_arc4random_uniform(upperBound: UInt32) -> UInt32 {
     #endif
 }
 
-func <=(lhs: [UInt64], rhs: [UInt64]) -> Bool {
-  for i in 0..<min(lhs.count,rhs.count) {
-    if (lhs[i] > rhs[i]) { return false }
-  }
-  return lhs.count <= rhs.count
-}
-
-let alphabet = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-let matrix = [
-  [1,1,1,1,1,1,1,1,1,1,1,1],
-  [11,10,9,8,7,6,5,4,3,2,1,0],
-  [55,45,36,28,21,15,10,6,3,1,0,0],
-  [165,120,84,56,35,20,10,4,1,0,0,0],
-  [330,210,126,70,35,15,5,1,0,0,0,0],
-  [462,252,126,56,21,6,1,0,0,0,0,0],
-  [462,210,84,28,7,1,0,0,0,0,0,0],
-  [330,120,36,8,1,0,0,0,0,0,0,0]
-]
-
-func mmr(row : Int, values : [UInt64]) -> UInt64 {
+func hash(data : [UInt8]) -> UInt64 {
   var result = UInt64(0)
-  for col in 0..<(min(values.count,matrix[row].count)) {
-    result = result + UInt64(matrix[row][col]) * values[col]
+  for c in data {
+    result = result &* UInt64(257) &+ UInt64(c)
   }
   return result
 }
 
-func mm(values : [UInt64]) -> [UInt64] {
-  var result = [UInt64](count: matrix.count, repeatedValue: 0)
-  for i in 0..<matrix.count {
-    result[i] = mmr(i, values: values)
+let len = 12
+let suffixLen = 3
+let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+// let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// let alphabet = "0123456789"
+let refAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+print("Build suffix map")
+var suffixMap = [UInt64: String]()
+var maxHash = UInt64(0)
+var minHash = UInt64(0xffffffffffffff)
+func buildSuffixMap(prefix : String) {
+  let l = prefix.unicodeScalars.count + 1
+  for c in alphabet.unicodeScalars {
+    let s = prefix + String(c)
+    if (l == suffixLen) {
+      let h = s.objcHash()
+      maxHash = max(maxHash, h)
+      minHash = min(minHash, h)
+      suffixMap[h] = s
+    } else {
+      if (l <= suffixLen - 2) { print(s, terminator: " ") }
+      buildSuffixMap(s)
+    }
   }
-  return result
 }
+buildSuffixMap("")
+print("")
+let qmaxHash = maxHash * UInt64(257 * 257 * 257) + maxHash
+let qminHash = minHash * UInt64(257 * 257 * 257) + minHash
+print(String(suffixMap.count) + " " + String(minHash) + ".." + String(maxHash) + " " + String(qminHash) + ".." + String(qmaxHash))
 
 var referenceInput = ""
-for i in 0..<12 {
-  referenceInput = referenceInput + String(alphabet[Int(cs_arc4random_uniform(UInt32(alphabet.characters.count)))])
+for i in 0..<len {
+  referenceInput = referenceInput + String(refAlphabet[Int(cs_arc4random_uniform(UInt32(refAlphabet.characters.count)))])
 }
-print("Trying to collide: " + referenceInput)
-let referenceVector = referenceInput.unicodeScalars.map({ UInt64($0.value) })
-let result = mm(referenceVector)
-
-print(result)
-
-var best = ""
-
-func search(prefix : String) {
-  if (prefix.characters.count > best.characters.count) {
-    best = prefix
-    print(prefix)
+var rh = referenceInput.objcHash()
+while (rh < qmaxHash) {
+  referenceInput = ""
+  for i in 0..<len {
+    referenceInput = referenceInput + String(refAlphabet[Int(cs_arc4random_uniform(UInt32(refAlphabet.characters.count)))])
   }
-  for c in alphabet.characters {
-    let s = prefix + String(c)
-    let v = s.unicodeScalars.map({ UInt64($0.value) })
-    let m = mm(v)
-    if (m <= result) {
-      switch (s.characters.count) {
-        case 12: if (m[0] == result[0]) { print("-> " + s) }
-        case 11: if (m[1] == result[1]) { search(s) }
-        case 10: if (m[2] == result[2]) { search(s) }
-        case  9: if (m[3] == result[3]) { search(s) }
-        case  8: if (m[4] == result[4]) { search(s) }
-        case  7: if (m[5] == result[5]) { search(s) }
-        case  6: if (m[6] == result[6]) { search(s) }
-        case  5: if (m[7] == result[7]) { search(s) }
-        default: search(s)
+  rh = referenceInput.objcHash()
+}
+
+let p1lo = rh - qmaxHash
+let p1hi = rh - qminHash
+let p2lo = rh - maxHash
+let p2hi = rh - minHash
+print("P1 in [" + String(p1lo) + "," + String(p1hi)  + "]")
+print("P2 in [" + String(p2lo) + "," + String(p2hi)  + "]")
+print("")
+print("Collide: " + referenceInput + " -> " + String(rh))
+print("")
+
+let f2 = UInt64(257 * 257 * 257)
+let f1 = UInt64(257 * 257 * 257) &* UInt64(257 * 257 * 257)
+let f0 = UInt64(257 * 257 * 257) &* UInt64(257 * 257 * 257) &* UInt64(257 * 257 * 257)
+
+var t = 0
+for (k0,v0) in suffixMap {
+  t = t + 1
+  if (t % 1000 == 0) {
+    let p = Double(t * 100000 / suffixMap.count) / 100000.0 * 100.0
+    print(String(t) + "/" + String(suffixMap.count) + " :: " + String(p) + "%")
+  }
+
+  let h0 = k0 &* f0
+  for (k1,v1) in suffixMap {
+    let h1 = h0 &+ k1 &* f1
+    if (h1 > p1hi || h1 < p1lo) { continue }
+    for (k2,v2) in suffixMap {
+      let h2 = h1 &+ k2 &* f2
+      if (h2 > p2hi || h2 < p2lo) { continue }
+      let missing = rh &- h2
+      if let v3 = suffixMap[missing] {
+        let s = v0 + v1 + v2 + v3
+        print(s + " -> " + String(s.objcHash()))
       }
     }
   }
 }
 
-search("")
